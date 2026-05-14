@@ -1,0 +1,22 @@
+{
+  "id": "mini-lcm",
+  "name": "Mini LCM",
+  "description": "Lightweight Lossless Context Management with cross-session memory, FTS5, and vector search",
+  "version": "0.1.0",
+  "kind": "context-engine",
+  "slots": {
+    "contextEngine": "mini-lcm"
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "entry": "dist/index.js",
+  "config": {
+    "freshTailCount": 64,
+    "contextThreshold": 0.75,
+    "summaryModel": "xiaomi-tokenplan/mimo-v2.5-pro",
+    "embeddingModel": "dashscope/text-embedding-v3",
+    "embeddingDim": 1024,
+    "dbPath": "~/.openclaw/mini-lcm.db"
+  }
+}

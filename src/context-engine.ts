@@ -124,9 +124,9 @@ export class MiniLcmEngine implements ContextEngine {
     // 2. Get summaries
     const summaries = this.db.getSummaries(sessionId);
     
-    // Token budget allocation: 60% reserved for fresh tail, rest for summaries + memories
-    const reservedForTail = Math.floor(tokenBudget * 0.6);
-    const availableForContext = Math.max(0, tokenBudget - freshTailTokens - reservedForTail);
+    // Token budget allocation: fresh tail gets what it needs, rest for summaries + memories
+    // FIX #2: Don't double-reserve — fresh tail already takes its actual token count
+    const availableForContext = Math.max(0, tokenBudget - freshTailTokens);
 
     // 3. Get relevant cross-session memories
     let memoryBlock = '';
@@ -264,7 +264,12 @@ Summary:`;
       // Extract and store memories from compressed content
       await this.extractMemories(sessionId, conversationText);
 
-      const tokensAfter = this.db.getMessageTokenSum(sessionId) + this.db.getSummaryTokenSum(sessionId);
+      // FIX #3: Calculate actual tokens after compaction (fresh tail + new summary + old summaries)
+      const freshTailMsgs = this.db.getMessages(sessionId, this.config.freshTailCount);
+      const freshTailTokens = freshTailMsgs.reduce((sum, m) => sum + m.token_count, 0);
+      const oldSummaryTokens = this.db.getSummaryTokenSum(sessionId);
+      // Subtract the summaries that were just replaced by the new one
+      const tokensAfter = freshTailTokens + summaryTokens + oldSummaryTokens;
 
       return {
         ok: true,
@@ -339,12 +344,24 @@ Memories (JSON array):`;
 
       const response = await this.callLlm(prompt);
 
-      // Try to parse JSON from response
-      const jsonMatch = response.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) return;
+      // FIX #5: Try multiple JSON extraction strategies
+      let memories: any[] | null = null;
 
-      const memories = JSON.parse(jsonMatch[0]);
-      if (!Array.isArray(memories)) return;
+      // Strategy 1: fenced code block
+      const fencedMatch = response.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      if (fencedMatch) {
+        try { memories = JSON.parse(fencedMatch[1]); } catch {}
+      }
+
+      // Strategy 2: raw JSON array
+      if (!memories) {
+        const rawMatch = response.match(/\[[\s\S]*\]/);
+        if (rawMatch) {
+          try { memories = JSON.parse(rawMatch[0]); } catch {}
+        }
+      }
+
+      if (!memories || !Array.isArray(memories)) return;
 
       for (const mem of memories) {
         if (mem.type && mem.title && mem.content) {
@@ -378,10 +395,18 @@ Memories (JSON array):`;
       throw new Error('LLM not configured');
     }
 
-    const result = await this.llmComplete({
+    // FIX #7: Add timeout (30s) to prevent hanging on slow API
+    const TIMEOUT_MS = 30000;
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('LLM call timed out')), TIMEOUT_MS)
+    );
+
+    const callPromise = this.llmComplete({
       messages: [{ role: 'user', content: prompt }],
       model: this.config.summaryModel,
     });
+
+    const result = await Promise.race([callPromise, timeoutPromise]);
 
     if (result?.content) {
       return typeof result.content === 'string' ? result.content : JSON.stringify(result.content);

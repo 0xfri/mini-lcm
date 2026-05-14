@@ -44,6 +44,14 @@ export interface MemoryRow {
   concepts: string;       // JSON array
   source_session: string;
   importance: number;      // 1-5
+  // FIX #9: Safety fields in interface
+  confidence: number;
+  evidence: string | null;
+  verified: number;        // 0 or 1
+  content_hash: string | null;
+  recall_count: number;
+  last_recalled: string | null;
+  conflict_flag: number;   // 0 or 1
   created_at: string;
   expires_at: string | null;
 }
@@ -94,8 +102,6 @@ export class MiniLcmDb {
         source_end_seq INTEGER NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
-
-
 
       -- Cross-session persistent memories
       CREATE TABLE IF NOT EXISTS memories (

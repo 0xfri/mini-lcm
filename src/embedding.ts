@@ -95,7 +95,10 @@ export function vectorToBuffer(vector: Float32Array): Buffer {
 
 /**
  * Deserialize Buffer to Float32Array
+ * FIX #1: Copy to aligned ArrayBuffer to avoid byteOffset misalignment
  */
 export function bufferToVector(buffer: Buffer): Float32Array {
-  return new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
+  const copy = new ArrayBuffer(buffer.byteLength);
+  new Uint8Array(copy).set(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
+  return new Float32Array(copy);
 }

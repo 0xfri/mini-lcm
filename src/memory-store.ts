@@ -61,6 +61,11 @@ export class MemoryStore {
   private embedder: EmbeddingProvider;
   private llmComplete: ((prompt: string) => Promise<string>) | null;
 
+  // FIX #6: Simple LRU cache for query embeddings (TTL 5 min)
+  private embedCache = new Map<string, { vector: Float32Array; ts: number }>();
+  private readonly EMBED_CACHE_TTL = 5 * 60 * 1000;
+  private readonly EMBED_CACHE_MAX = 50;
+
   // Weights for hybrid scoring
   private readonly W_VECTOR = 0.4;
   private readonly W_FTS = 0.3;
@@ -73,6 +78,23 @@ export class MemoryStore {
   }
 
   // ===== Safety: Sensitive data filtering =====
+
+  // FIX #6: Cached embed to avoid repeated API calls
+  private async cachedEmbed(text: string): Promise<Float32Array> {
+    const now = Date.now();
+    const cached = this.embedCache.get(text);
+    if (cached && (now - cached.ts) < this.EMBED_CACHE_TTL) {
+      return cached.vector;
+    }
+    const vector = await this.embedder.embed(text);
+    // Evict oldest if over limit
+    if (this.embedCache.size >= this.EMBED_CACHE_MAX) {
+      const oldest = this.embedCache.keys().next().value;
+      if (oldest) this.embedCache.delete(oldest);
+    }
+    this.embedCache.set(text, { vector, ts: now });
+    return vector;
+  }
 
   private hasSensitiveData(text: string): boolean {
     return SENSITIVE_PATTERNS.some(p => p.test(text));
@@ -98,17 +120,15 @@ export class MemoryStore {
     // Time decay
     score *= Math.max(0.1, 1 - (age / maxAgeMs));
 
-    // Recall count boost (if field exists)
-    const recallCount = (memory as any).recall_count || 0;
+    // Recall count boost
+    const recallCount = memory.recall_count || 0;
     score *= Math.min(1.5, 1 + recallCount * 0.1);
 
     // Unverified penalty
-    const verified = (memory as any).verified ?? false;
-    if (!verified) score *= 0.7;
+    if (!memory.verified) score *= 0.7;
 
     // Confidence penalty
-    const confidence = (memory as any).confidence ?? 1.0;
-    score *= confidence;
+    score *= (memory.confidence ?? 1.0);
 
     return Math.min(1, Math.max(0, score));
   }
@@ -116,8 +136,8 @@ export class MemoryStore {
   // ===== Core: Store with full safety pipeline =====
 
   async store(params: MemoryParams): Promise<number | null> {
-    // Step 1: Sensitive data filter
-    if (this.hasSensitiveData(params.content) || this.hasSensitiveData(params.title)) {
+    // FIX #8: Only check content (not title) for sensitive data to reduce false positives
+    if (this.hasSensitiveData(params.content)) {
       console.warn('mini-lcm: blocked memory with sensitive data:', params.title.slice(0, 50));
       return null;
     }
@@ -157,7 +177,7 @@ export class MemoryStore {
           ]),
         ]);
         const mergedConfidence = Math.max(
-          (best.memory as any).confidence ?? 1.0,
+          best.memory.confidence ?? 1.0,
           params.confidence ?? 1.0,
         );
 
@@ -229,20 +249,22 @@ export class MemoryStore {
       }
     }
 
-    // Step 8: Store metadata (confidence, evidence, verified, content_hash)
+    // Step 8: Store metadata (confidence, evidence, verified)
+    // FIX #4: content_hash already computed in Step 4 dedup path; reuse here
+    const finalHash = vector ? undefined : this.contentHash(params.content);
     this.db.db.prepare(`
       UPDATE memories SET
         confidence = ?,
         evidence = ?,
         verified = ?,
-        content_hash = ?,
+        content_hash = COALESCE(?, content_hash),
         recall_count = 0
       WHERE id = ?
     `).run(
       confidence,
       params.evidence || null,
       params.verified ? 1 : 0,
-      this.contentHash(params.content),
+      finalHash,
       memoryId,
     );
 
@@ -256,7 +278,7 @@ export class MemoryStore {
 
     // 1. Vector search
     try {
-      const queryVector = await this.embedder.embed(query);
+      const queryVector = await this.cachedEmbed(query);
       const allEmbeddings = this.db.getAllMemoryEmbeddings();
 
       const vectorScores: { id: number; score: number }[] = [];

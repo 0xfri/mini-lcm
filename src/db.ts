@@ -210,8 +210,8 @@ export class MiniLcmDb {
 
   getMessages(sessionId: string, limit?: number): MessageRow[] {
     const sql = limit
-      ? `SELECT * FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?`
-      : `SELECT * FROM messages WHERE session_id = ? ORDER BY seq`;
+      ? `SELECT id, session_id, seq, role, content, token_count, created_at FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?`
+      : `SELECT id, session_id, seq, role, content, token_count, created_at FROM messages WHERE session_id = ? ORDER BY seq`;
     const rows = limit
       ? this.db.prepare(sql).all(sessionId, limit) as MessageRow[]
       : this.db.prepare(sql).all(sessionId) as MessageRow[];
@@ -264,7 +264,7 @@ export class MiniLcmDb {
 
   searchMemoriesFts(query: string, limit = 10): (MemoryRow & { rank: number })[] {
     return this.db.prepare(`
-      SELECT m.*, bm25(memory_fts) as rank
+      SELECT m.*, COALESCE(bm25(memory_fts), 0) as rank
       FROM memory_fts
       JOIN memories m ON memory_fts.rowid = m.id
       WHERE memory_fts MATCH ?

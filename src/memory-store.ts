@@ -22,7 +22,7 @@ const SENSITIVE_PATTERNS: RegExp[] = [
   /(?:api[_-]?key|token|secret|password|credential|bearer)\s*[:=]\s*\S+/i,
   /(?:sk-|pk-|ghp_|gho_|github_pat_|tvly-)\S+/,
   /-----BEGIN.*(?:KEY|CERTIFICATE|PRIVATE)-----/,
-  /(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?/,  // IP addresses
+  /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/,  // IP addresses (with word boundary)
   /Bearer\s+\S+/i,
 ];
 
@@ -250,21 +250,20 @@ export class MemoryStore {
     }
 
     // Step 8: Store metadata (confidence, evidence, verified)
-    // FIX #4: content_hash already computed in Step 4 dedup path; reuse here
-    const finalHash = vector ? undefined : this.contentHash(params.content);
+    // FIX #6: Always compute content_hash, even when vector exists
     this.db.db.prepare(`
       UPDATE memories SET
         confidence = ?,
         evidence = ?,
         verified = ?,
-        content_hash = COALESCE(?, content_hash),
+        content_hash = ?,
         recall_count = 0
       WHERE id = ?
     `).run(
       confidence,
       params.evidence || null,
       params.verified ? 1 : 0,
-      finalHash,
+      this.contentHash(params.content),
       memoryId,
     );
 
@@ -397,13 +396,22 @@ export class MemoryStore {
 
   private async findSimilarMemories(vector: Float32Array, threshold: number): Promise<{ memory: MemoryRow; similarity: number }[]> {
     const allEmbeddings = this.db.getAllMemoryEmbeddings();
-    const results: { memory: MemoryRow; similarity: number }[] = [];
+    if (allEmbeddings.length === 0) return [];
 
+    // FIX #9: Batch fetch all candidate memories in one query
+    const ids = allEmbeddings.map(e => e.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const memoryRows = this.db.db.prepare(
+      `SELECT * FROM memories WHERE id IN (${placeholders})`
+    ).all(...ids) as MemoryRow[];
+    const memoryMap = new Map(memoryRows.map(m => [m.id, m]));
+
+    const results: { memory: MemoryRow; similarity: number }[] = [];
     for (const emb of allEmbeddings) {
       const vec = bufferToVector(emb.vector);
       const sim = cosineSimilarity(vector, vec);
       if (sim >= threshold) {
-        const memory = this.db.db.prepare('SELECT * FROM memories WHERE id = ?').get(emb.id) as MemoryRow;
+        const memory = memoryMap.get(emb.id);
         if (memory) {
           results.push({ memory, similarity: sim });
         }

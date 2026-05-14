@@ -39,7 +39,7 @@ export class MiniLcmEngine implements ContextEngine {
   readonly info: ContextEngineInfo = {
     id: 'mini-lcm',
     name: 'Mini LCM',
-    version: '2026.05.14.002',
+    version: '2026.05.14.003',
     ownsCompaction: true,
   };
 
@@ -71,11 +71,37 @@ export class MiniLcmEngine implements ContextEngine {
   // ===== Lifecycle =====
 
   async bootstrap(params: { sessionId: string; sessionKey?: string; sessionFile: string }): Promise<BootstrapResult> {
-    // Ensure tables exist (already done in constructor via migrate)
-    const msgCount = this.db.getMessageCount(params.sessionId);
+    // FIX #4: Import historical messages from session file if DB is empty
+    let importedMessages = 0;
+    const existingCount = this.db.getMessageCount(params.sessionId);
+
+    if (existingCount === 0 && params.sessionFile) {
+      try {
+        const { readFileSync, existsSync } = await import('fs');
+        if (existsSync(params.sessionFile)) {
+          const lines = readFileSync(params.sessionFile, 'utf-8').split('\n').filter(Boolean);
+          for (const line of lines) {
+            try {
+              const entry = JSON.parse(line);
+              if (entry.role && entry.content) {
+                const content = typeof entry.content === 'string'
+                  ? entry.content : JSON.stringify(entry.content);
+                const seq = this.db.getNextMessageSeq(params.sessionId);
+                const tokenCount = estimateMessageTokens({ role: entry.role, content: entry.content });
+                this.db.insertMessage(params.sessionId, seq, entry.role, content, tokenCount);
+                importedMessages++;
+              }
+            } catch {}
+          }
+        }
+      } catch (err) {
+        console.warn('mini-lcm: bootstrap import failed:', err);
+      }
+    }
+
     return {
       bootstrapped: true,
-      importedMessages: msgCount,
+      importedMessages,
     };
   }
 
@@ -148,7 +174,7 @@ export class MiniLcmEngine implements ContextEngine {
     // Trim summaries to fit remaining budget (newest first, drop oldest if needed)
     let runningTokens = memoryTokens;
     const trimmedSummaries: typeof summaries = [];
-    for (const summary of summaries.reverse()) {
+    for (const summary of [...summaries].reverse()) {
       if (runningTokens + summary.token_count > availableForContext) break;
       trimmedSummaries.unshift(summary);
       runningTokens += summary.token_count;
@@ -264,12 +290,11 @@ Summary:`;
       // Extract and store memories from compressed content
       await this.extractMemories(sessionId, conversationText);
 
-      // FIX #3: Calculate actual tokens after compaction (fresh tail + new summary + old summaries)
+      // FIX: tokensAfter = fresh tail + all summaries (getSummaryTokenSum already includes the new one)
       const freshTailMsgs = this.db.getMessages(sessionId, this.config.freshTailCount);
       const freshTailTokens = freshTailMsgs.reduce((sum, m) => sum + m.token_count, 0);
-      const oldSummaryTokens = this.db.getSummaryTokenSum(sessionId);
-      // Subtract the summaries that were just replaced by the new one
-      const tokensAfter = freshTailTokens + summaryTokens + oldSummaryTokens;
+      const allSummaryTokens = this.db.getSummaryTokenSum(sessionId);
+      const tokensAfter = freshTailTokens + allSummaryTokens;
 
       return {
         ok: true,
@@ -395,26 +420,34 @@ Memories (JSON array):`;
       throw new Error('LLM not configured');
     }
 
-    // FIX #7: Add timeout (30s) to prevent hanging on slow API
+    // FIX #5: Add timeout with AbortController to actually cancel the request
     const TIMEOUT_MS = 30000;
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('LLM call timed out')), TIMEOUT_MS)
-    );
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-    const callPromise = this.llmComplete({
-      messages: [{ role: 'user', content: prompt }],
-      model: this.config.summaryModel,
-    });
+    try {
+      const result = await this.llmComplete({
+        messages: [{ role: 'user', content: prompt }],
+        model: this.config.summaryModel,
+        signal: controller.signal,
+      });
 
-    const result = await Promise.race([callPromise, timeoutPromise]);
+      clearTimeout(timeoutId);
 
-    if (result?.content) {
-      return typeof result.content === 'string' ? result.content : JSON.stringify(result.content);
+      if (result?.content) {
+        return typeof result.content === 'string' ? result.content : JSON.stringify(result.content);
+      }
+      if (result?.text) return result.text;
+      if (typeof result === 'string') return result;
+
+      throw new Error('Unexpected LLM response format');
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      if (err.name === 'AbortError') {
+        throw new Error('LLM call timed out');
+      }
+      throw err;
     }
-    if (result?.text) return result.text;
-    if (typeof result === 'string') return result;
-    
-    throw new Error('Unexpected LLM response format');
   }
 
   // ===== Cleanup =====

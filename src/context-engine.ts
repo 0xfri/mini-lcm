@@ -39,7 +39,7 @@ export class MiniLcmEngine implements ContextEngine {
   readonly info: ContextEngineInfo = {
     id: 'mini-lcm',
     name: 'Mini LCM',
-    version: '2026.5.14.001',
+    version: '2026.05.14.002',
     ownsCompaction: true,
   };
 

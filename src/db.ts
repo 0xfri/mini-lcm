@@ -263,6 +263,12 @@ export class MiniLcmDb {
   }
 
   searchMemoriesFts(query: string, limit = 10): (MemoryRow & { rank: number })[] {
+    // Sanitize query for FTS5: wrap each word in quotes to prevent operator interpretation
+    // FTS5 treats hyphens as NOT operators and can misparse column names
+    const words = query.replace(/[\[\]"*:^()]/g, ' ').split(/\s+/).filter(Boolean);
+    if (words.length === 0) return [];
+    const sanitized = words.map(w => `"${w}"`).join(' ');
+
     return this.db.prepare(`
       SELECT m.*, COALESCE(bm25(memory_fts), 0) as rank
       FROM memory_fts
@@ -271,7 +277,7 @@ export class MiniLcmDb {
         AND (m.expires_at IS NULL OR m.expires_at > datetime('now'))
       ORDER BY rank
       LIMIT ?
-    `).all(query, limit) as (MemoryRow & { rank: number })[];
+    `).all(sanitized, limit) as (MemoryRow & { rank: number })[];
   }
 
   getMemoriesByConcept(concept: string, limit = 10): MemoryRow[] {

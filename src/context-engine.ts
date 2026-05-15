@@ -25,6 +25,18 @@ import { estimateTokens, estimateMessageTokens } from './token-estimator.js';
 import { MemoryStore } from './memory-store.js';
 import { DashscopeEmbedding } from './embedding.js';
 
+// Helper: extract text from OpenClaw message content (string or content parts array)
+function extractText(content: string | any[]): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p: any) => p.type === 'text' && p.text)
+      .map((p: any) => p.text)
+      .join('\n');
+  }
+  return JSON.stringify(content);
+}
+
 // Default config values
 const DEFAULTS = {
   freshTailCount: 64,
@@ -88,12 +100,16 @@ export class MiniLcmEngine implements ContextEngine {
               // Handle OpenClaw session format: { type: 'message', message: { role, content } }
               if (entry.type === 'message' && entry.message?.role) {
                 const msg = entry.message;
+
+                // Skip non-conversation messages (thinking, tool_use, tool_result)
+                if (msg.role === 'tool' || msg.role === 'function') continue;
+
                 let textContent: string;
 
                 if (typeof msg.content === 'string') {
                   textContent = msg.content;
                 } else if (Array.isArray(msg.content)) {
-                  // Extract text from content parts, skip thinking/tool_use
+                  // Extract text from content parts, skip thinking/tool_use/tool_result
                   textContent = msg.content
                     .filter((p: any) => p.type === 'text' && p.text)
                     .map((p: any) => p.text)
@@ -186,9 +202,7 @@ export class MiniLcmEngine implements ContextEngine {
     if (incomingMessages.length > 0) {
       // Use incoming messages as the source of truth
       freshTail = incomingMessages.map(m => {
-        const content = typeof m.content === 'string'
-          ? m.content
-          : JSON.stringify(m.content);
+        const content = extractText(m.content);
         return {
           role: m.role,
           content,
@@ -197,18 +211,19 @@ export class MiniLcmEngine implements ContextEngine {
       });
 
       // Also ingest these into DB for future reference
+      // Fetch existing DB messages ONCE for dedup (not per-message)
+      const existingForDedup = this.db.getMessages(sessionId, this.config.freshTailCount);
+      const existingContents = new Set(existingForDedup.map(e => e.content));
+
       for (const msg of incomingMessages) {
         try {
-          const content = typeof msg.content === 'string'
-            ? msg.content
-            : JSON.stringify(msg.content);
-          // Check if already in DB (by content match on last few)
-          const existing = this.db.getMessages(sessionId, 5);
-          const alreadyExists = existing.some(e => e.content === content);
-          if (!alreadyExists && content.length > 0) {
+          const content = extractText(msg.content);
+          // Skip empty or already-stored messages
+          if (content.length > 0 && !existingContents.has(content)) {
             const seq = this.db.getNextMessageSeq(sessionId);
             const tokenCount = estimateMessageTokens({ role: msg.role, content: msg.content });
             this.db.insertMessage(sessionId, seq, msg.role, content, tokenCount);
+            existingContents.add(content); // Prevent intra-batch dupes too
           }
         } catch {}
       }
@@ -310,6 +325,11 @@ export class MiniLcmEngine implements ContextEngine {
     
     if (!force && totalTokens < threshold) {
       return { ok: true, compacted: false, reason: 'below threshold' };
+    }
+
+    // Guard: LLM must be configured for compaction
+    if (!this.llmComplete) {
+      return { ok: false, compacted: false, reason: 'LLM not configured' };
     }
 
     // BUG #3 FIX: Only compress messages after last compacted seq

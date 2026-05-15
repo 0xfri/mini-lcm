@@ -2,7 +2,7 @@
   "id": "mini-lcm",
   "name": "Mini LCM",
   "description": "Lightweight Lossless Context Management with cross-session memory, FTS5, and vector search",
-  "version": "2026.05.14.003",
+  "version": "2026.05.15.004",
   "kind": "context-engine",
   "slots": {
     "contextEngine": "mini-lcm"

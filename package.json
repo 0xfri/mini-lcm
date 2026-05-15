@@ -1,6 +1,6 @@
 {
   "name": "@local/mini-lcm",
-  "version": "2026.05.14.003",
+  "version": "2026.05.15.004",
   "private": true,
   "type": "module",
   "main": "dist/index.js",

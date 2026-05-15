@@ -39,7 +39,7 @@ export class MiniLcmEngine implements ContextEngine {
   readonly info: ContextEngineInfo = {
     id: 'mini-lcm',
     name: 'Mini LCM',
-    version: '2026.05.14.003',
+    version: '2026.05.15.004',
     ownsCompaction: true,
   };
 
@@ -71,7 +71,8 @@ export class MiniLcmEngine implements ContextEngine {
   // ===== Lifecycle =====
 
   async bootstrap(params: { sessionId: string; sessionKey?: string; sessionFile: string }): Promise<BootstrapResult> {
-    // FIX #4: Import historical messages from session file if DB is empty
+    // FIX: Import historical messages from session file if DB is empty
+    // Handles OpenClaw's actual JSONL format: { type: 'message', message: { role, content } }
     let importedMessages = 0;
     const existingCount = this.db.getMessageCount(params.sessionId);
 
@@ -83,13 +84,41 @@ export class MiniLcmEngine implements ContextEngine {
           for (const line of lines) {
             try {
               const entry = JSON.parse(line);
-              if (entry.role && entry.content) {
+
+              // Handle OpenClaw session format: { type: 'message', message: { role, content } }
+              if (entry.type === 'message' && entry.message?.role) {
+                const msg = entry.message;
+                let textContent: string;
+
+                if (typeof msg.content === 'string') {
+                  textContent = msg.content;
+                } else if (Array.isArray(msg.content)) {
+                  // Extract text from content parts, skip thinking/tool_use
+                  textContent = msg.content
+                    .filter((p: any) => p.type === 'text' && p.text)
+                    .map((p: any) => p.text)
+                    .join('\n');
+                } else {
+                  textContent = JSON.stringify(msg.content);
+                }
+
+                if (textContent && textContent.length > 0) {
+                  const seq = this.db.getNextMessageSeq(params.sessionId);
+                  const tokenCount = estimateTokens(textContent);
+                  this.db.insertMessage(params.sessionId, seq, msg.role, textContent, tokenCount);
+                  importedMessages++;
+                }
+              }
+              // Also handle simple format: { role, content }
+              else if (entry.role && entry.content) {
                 const content = typeof entry.content === 'string'
                   ? entry.content : JSON.stringify(entry.content);
-                const seq = this.db.getNextMessageSeq(params.sessionId);
-                const tokenCount = estimateMessageTokens({ role: entry.role, content: entry.content });
-                this.db.insertMessage(params.sessionId, seq, entry.role, content, tokenCount);
-                importedMessages++;
+                if (content.length > 0) {
+                  const seq = this.db.getNextMessageSeq(params.sessionId);
+                  const tokenCount = estimateMessageTokens({ role: entry.role, content: entry.content });
+                  this.db.insertMessage(params.sessionId, seq, entry.role, content, tokenCount);
+                  importedMessages++;
+                }
               }
             } catch {}
           }
@@ -142,19 +171,65 @@ export class MiniLcmEngine implements ContextEngine {
     prompt?: string;
   }): Promise<AssembleResult> {
     const { sessionId, tokenBudget = 128000 } = params;
-    
-    // 1. Get fresh tail (recent raw messages)
-    const freshTail = this.db.getMessages(sessionId, this.config.freshTailCount);
+
+    // FIX: Use OpenClaw-provided messages as the primary source
+    // DB is used for summaries, memories, and historical context only
+    const incomingMessages = params.messages || [];
+
+    // 1. Also try to get any additional messages from DB (for cross-session continuity)
+    const dbMessages = this.db.getMessages(sessionId, this.config.freshTailCount);
+
+    // 2. Build the fresh tail: prefer incoming messages, supplement with DB
+    // Deduplicate by content to avoid repeats
+    let freshTail: { role: string; content: string; token_count: number }[] = [];
+
+    if (incomingMessages.length > 0) {
+      // Use incoming messages as the source of truth
+      freshTail = incomingMessages.map(m => {
+        const content = typeof m.content === 'string'
+          ? m.content
+          : JSON.stringify(m.content);
+        return {
+          role: m.role,
+          content,
+          token_count: estimateMessageTokens({ role: m.role, content: m.content }),
+        };
+      });
+
+      // Also ingest these into DB for future reference
+      for (const msg of incomingMessages) {
+        try {
+          const content = typeof msg.content === 'string'
+            ? msg.content
+            : JSON.stringify(msg.content);
+          // Check if already in DB (by content match on last few)
+          const existing = this.db.getMessages(sessionId, 5);
+          const alreadyExists = existing.some(e => e.content === content);
+          if (!alreadyExists && content.length > 0) {
+            const seq = this.db.getNextMessageSeq(sessionId);
+            const tokenCount = estimateMessageTokens({ role: msg.role, content: msg.content });
+            this.db.insertMessage(sessionId, seq, msg.role, content, tokenCount);
+          }
+        } catch {}
+      }
+    } else if (dbMessages.length > 0) {
+      // Fallback to DB messages if no incoming messages
+      freshTail = dbMessages.map(m => ({
+        role: m.role,
+        content: m.content,
+        token_count: m.token_count,
+      }));
+    }
+
     const freshTailTokens = freshTail.reduce((sum, m) => sum + m.token_count, 0);
-    
-    // 2. Get summaries
+
+    // 3. Get summaries
     const summaries = this.db.getSummaries(sessionId);
-    
+
     // Token budget allocation: fresh tail gets what it needs, rest for summaries + memories
-    // FIX #2: Don't double-reserve — fresh tail already takes its actual token count
     const availableForContext = Math.max(0, tokenBudget - freshTailTokens);
 
-    // 3. Get relevant cross-session memories
+    // 4. Get relevant cross-session memories
     let memoryBlock = '';
     let memoryTokens = 0;
     try {
@@ -181,7 +256,7 @@ export class MiniLcmEngine implements ContextEngine {
     }
     const summaryTokens = trimmedSummaries.reduce((sum, s) => sum + s.token_count, 0);
 
-    // 4. Build assembled messages
+    // 5. Build assembled messages
     const assembled: AgentMessage[] = [];
 
     // Add memory block as system message if present
